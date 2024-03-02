@@ -1,0 +1,7 @@
+{
+  "nb_transformer_blocks": 12,
+  "nb_attn_heads": 12,
+  "nb_embeddings": 768,
+  "vocab_size": 50257,
+  "context_length": 1024
+}
