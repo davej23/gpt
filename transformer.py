@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from collections import defaultdict
 
-import sys
 import logging
 import math
 import json
