@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from collections import defaultdict
 
+import sys
+import logging
 import math
 import json
 import time
@@ -13,6 +15,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.utils.data.dataloader import DataLoader
+
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,29 +69,26 @@ class NewGELU(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
-        assert config.nb_embeddings % config.nb_attn_heads == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.nb_embeddings, 3 * config.nb_embeddings)
-        # output projection
-        self.c_proj = nn.Linear(config.nb_embeddings, config.nb_embeddings)
-        # regularization
-        self.dropout_attn = nn.Dropout(config.dropout_attn)
-        self.dropout_resid = nn.Dropout(config.dropout_resid)
+        assert config.nb_embeddings % config.nb_attn_heads == 0, "nb_embeddings must be divisible by nb_attn_heads"
+        self.config = config
+
+        self.c_attn = nn.Linear(self.config.nb_embeddings, 3 * self.config.nb_embeddings)  # KQV projections
+        self.c_proj = nn.Linear(self.config.nb_embeddings, self.config.nb_embeddings)  # Output projection
+        self.dropout_attn = nn.Dropout(self.config.dropout_attn)
+        self.dropout_resid = nn.Dropout(self.config.dropout_resid)
         self.register_buffer(
             "bias",
-            torch.tril(torch.ones(config.context_length, config.context_length))
-            .view(1, 1, config.context_length, config.context_length)
+            torch.tril(torch.ones(self.config.context_length, self.config.context_length))
+            .view(1, 1, self.config.context_length, self.config.context_length)
         )
-        self.nb_attn_heads = config.nb_attn_heads
-        self.nb_embeddings = config.nb_embeddings
 
     def forward(self, x):
         batch_size, seq_length, nb_embedding = x.size()
 
-        q, k, v = self.c_attn(x).split(self.nb_embeddings, dim=2)
-        k = k.view(batch_size, seq_length, self.nb_attn_heads, nb_embedding // self.nb_attn_heads).transpose(1, 2)
-        q = q.view(batch_size, seq_length, self.nb_attn_heads, nb_embedding // self.nb_attn_heads).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.nb_attn_heads, nb_embedding // self.nb_attn_heads).transpose(1, 2)
+        q, k, v = self.c_attn(x).split(self.config.nb_embeddings, dim=2)
+        k = k.view(batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads).transpose(1, 2)
+        q = q.view(batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads).transpose(1, 2)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:, :, :seq_length, :seq_length] == 0, -torch.inf)
@@ -120,32 +123,31 @@ class TransformerBlock(nn.Module):
 
 class Transformer(torch.nn.Module):
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, log_level: str):
         super().__init__()
+
+        logger.setLevel(log_level)
 
         self.config = config
 
-        layer_weight_mean = config.lw_mean
-        layer_weight_std = config.lw_std
-
         self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.nb_embeddings),
-            wpe=nn.Embedding(config.context_length, config.nb_embeddings),
-            dropout=nn.Dropout(config.dropout_resid),
-            blocks=nn.ModuleList([TransformerBlock(config) for _ in range(config.nb_transformer_blocks)]),
-            ln_f=nn.LayerNorm(config.nb_embeddings),
+            wte=nn.Embedding(self.config.vocab_size, self.config.nb_embeddings),
+            wpe=nn.Embedding(self.config.context_length, self.config.nb_embeddings),
+            dropout=nn.Dropout(self.config.dropout_resid),
+            blocks=nn.ModuleList([TransformerBlock(self.config) for _ in range(self.config.nb_transformer_blocks)]),
+            ln_f=nn.LayerNorm(self.config.nb_embeddings),
         ))
-        self.output = nn.Linear(config.nb_embeddings, config.vocab_size, bias=False)
+        self.output = nn.Linear(self.config.nb_embeddings, self.config.vocab_size, bias=False)
 
-        # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
-        self.apply(lambda x: self._init_weights(x, mean=layer_weight_mean, std=layer_weight_std))
+        # Initialise weights using special initialisation for residual projections (from GPT-2 paper)
+        self.apply(lambda x: self._init_weights(x, mean=self.config.lw_mean, std=self.config.lw_std))
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.nb_transformer_blocks))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.nb_transformer_blocks))
 
-        # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
-        print("number of parameters: %.2fM" % (n_params/1e6,))
+
+        logger.info(f"Transformer : Number of parameters {(n_params/1e6):.2f}M")
 
     @staticmethod
     def _init_weights(module: torch.nn.Module, mean: float, std: float) -> None:
@@ -160,8 +162,11 @@ class Transformer(torch.nn.Module):
             torch.nn.init.ones_(module.weight)
 
     def forward(self, token_sequence, targets: Optional[torch.Tensor] = None):
+
+        logger.debug(f"Transformer : Token sequence size {token_sequence.size()} \t " +
+                     f"Targets size {targets.size() if targets is not None else None}")
+
         device = token_sequence.device
-        print("TRANSFORMER FORWARD", token_sequence.size(), targets.size() if targets is not None else None)
         batch_size, nb_tokens = token_sequence.size()
         assert nb_tokens <= self.config.context_length, \
             f"Cannot forward sequence of length {nb_tokens}, block size is only {self.config.context_length}"
@@ -169,15 +174,25 @@ class Transformer(torch.nn.Module):
 
         token_embeddings = self.transformer.wte(token_sequence)
         position_embeddings = self.transformer.wpe(pos)
+
+        logger.debug(f"Transformer : Token embeddings size {token_embeddings.size()} \t " +
+                     f"Position embeddings size {position_embeddings.size()}")
+
         x = self.transformer.dropout(token_embeddings + position_embeddings)
         for block in self.transformer.blocks:
             x = block(x)
+            logger.debug(f"Transformer : Block output size {x.size()}")
+
         x = self.transformer.ln_f(x)
 
+        logger.debug(f"Transformer : Layer norm output size {x.size()}")
+
         logits = self.output(x)
-        print("logits", logits.size())
-        print("logits view", logits.view(-1, logits.size(-1)).size())
-        print("targets view", targets.view(-1).shape if targets is not None else None)
+        logger.debug(f"Transformer : Logits output size {logits.size()}")
+
+        logger.debug(f"Transformer : Cross entropy logits size {logits.view(-1, logits.size(-1)).size()} \t " +
+                     f"Targets size {targets.view(-1).size() if targets is not None else None}")
+
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
         ) if targets is not None else None
@@ -189,37 +204,52 @@ class Transformer(torch.nn.Module):
             self, token_sequence: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
             do_sample: bool = False, top_k: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
+        self.eval()
+
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
             token_sequence_sliced = token_sequence if token_sequence.size(1) <= self.config.context_length \
                 else token_sequence[:, -self.config.context_length:]
-            # forward the model to get the logits for the index in the sequence
+
+            logger.debug(f"generate : Token sequence sliced size {token_sequence_sliced.size()}")
+
             logits, _ = self(token_sequence_sliced)
-            # pluck the logits at the final step and scale by desired temperature
+            logger.debug(f"generate : logits size {logits.size()}")
+
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            logger.debug(f"generate : new temperature-adjusted logits size {logits.size()}")
+
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+                logits[logits < v[:, [-1]]] = -torch.inf
+                logger.debug(f"generate : Top K size {v.size()}")
+
             probs = F.softmax(logits, dim=-1)
-            # either sample from the distribution or take the most likely element
+
+            logger.debug(f"generate : Probabilities size {probs.size()}")
+
             if do_sample:
                 token_next = torch.multinomial(probs, num_samples=1)
             else:
                 _, token_next = torch.topk(probs, k=1, dim=-1)
-            # append sampled index to the running sequence and continue
+
             token_sequence = torch.cat((token_sequence, token_next), dim=1)
+
+            logger.debug(f"generate : Token sequence output size {token_sequence.size()}")
 
         return token_sequence
 
 
 class Trainer:
+    """Trainer class
+    This class carries out conversion of dataset into a Torch DataLoader and training of GPT
+
+    Args:
+        config: TrainerConfig containing parameters for training
+        model: GPT
+        dataset: size (N, C)  N --> number of sequences, C --> context length, B --> batch size, V --> vocab size
+                 this is converted into a dataset of size (B, C, V)
+
+    """
 
     def __init__(self, config: TrainerConfig, model: Transformer, dataset: Any):
         self.config = config
@@ -234,7 +264,8 @@ class Trainer:
             self.device = config.device
 
         self.model = self.model.to(self.device)
-        print("running on device ", self.device)
+
+        logger.info(f"Transformer : Running on device {self.device}")
 
         self.batch_number = 0
         self.batch_start_time = 0.0
@@ -296,38 +327,48 @@ class Trainer:
             callback(self)
 
     def run(self) -> torch.nn.Module:
-        print("Started training...")
-        model, config = self.model, self.config
 
-        self.optimizer = self.configure_optimizers(config)
+        logger.debug("run : Training started")
+
+        self.optimizer = self.configure_optimizers(self.config)
+
+        logger.debug("run : Configured optimizer")
 
         train_loader = DataLoader(
             self.dataset,
             sampler=torch.utils.data.RandomSampler(self.dataset, replacement=True, num_samples=int(1e3)),
             shuffle=False,
             pin_memory=True,
-            batch_size=config.batch_size,
-            num_workers=config.nb_workers,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.nb_workers,
         )
 
-        model.train()
+        logger.debug("run : Created dataloader")
+
+        self.model.train()
         self.batch_number = 0
         self.batch_start_time = time.time()
         data_iter = iter(train_loader)
         while True:
-            print("Batch number ", self.batch_number)
+            logger.info(f"run : Batch number {self.batch_number}")
+
             try:
                 batch = next(data_iter)
             except StopIteration:
+                logger.debug("run : End of dataloader, recreating")
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
+
             batch = [t.to(self.device) for t in batch]
             x, y = batch
-            print("x y", x.size(), y.size())
-            logits, self.loss = model(x, y)
-            model.zero_grad(set_to_none=True)
+            logger.debug(f"run : x size {x.size()} \t y size {y.size()}")
+
+            logits, self.loss = self.model(x, y)
+            logger.debug(f"run : logits size {logits.size()} \t loss size {self.loss.size()}")
+
+            self.model.zero_grad(set_to_none=True)
             self.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_norm_clip)
             self.optimizer.step()
 
             self.trigger_callbacks("on_batch_end")
@@ -336,7 +377,7 @@ class Trainer:
             self.batch_time = batch_end_time - self.batch_start_time
             self.batch_start_time = batch_end_time
 
-            if config.max_iters and self.batch_number >= config.max_iters:
+            if self.config.max_iters and self.batch_number >= self.config.max_iters:
                 break
 
         return self.model
