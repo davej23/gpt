@@ -48,7 +48,7 @@ class TrainerConfig:
     max_iters: int = field(default=None)
     batch_size: int = field(default=64)
     learning_rate: int = field(default=3e-4)
-    betas: tuple[float] = field(default=(0.9, 0.95))
+    betas: tuple[float, float] = field(default=(0.9, 0.95))
     weight_decay: float = field(default=0.1)
     grad_norm_clip: float = field(default=1.0)
 
@@ -85,9 +85,10 @@ class CausalSelfAttention(nn.Module):
         batch_size, seq_length, nb_embedding = x.size()
 
         q, k, v = self.c_attn(x).split(self.config.nb_embeddings, dim=2)
-        k = k.view(batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads).transpose(1, 2)
-        q = q.view(batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads).transpose(1, 2)
+        qkv_view_size = (batch_size, seq_length, self.config.nb_attn_heads, nb_embedding // self.config.nb_attn_heads)
+        k = k.view(qkv_view_size).transpose(1, 2)
+        q = q.view(qkv_view_size).transpose(1, 2)
+        v = v.view(qkv_view_size).transpose(1, 2)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:, :, :seq_length, :seq_length] == 0, -torch.inf)
@@ -140,11 +141,11 @@ class Transformer(torch.nn.Module):
 
         # Initialise weights using special initialisation for residual projections (from GPT-2 paper)
         self.apply(lambda x: self._init_weights(x, mean=self.config.lw_mean, std=self.config.lw_std))
-        for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.nb_transformer_blocks))
+        for param_name, param in self.named_parameters():
+            if param_name.endswith("c_proj.weight"):
+                torch.nn.init.normal_(param, mean=0.0, std=0.02/math.sqrt(2 * self.config.nb_transformer_blocks))
 
-        n_params = sum(p.numel() for p in self.transformer.parameters())
+        n_params = sum(param.numel() for param in self.transformer.parameters())
 
         logger.info(f"Transformer : Number of parameters {(n_params/1e6):.2f}M")
 
@@ -161,7 +162,6 @@ class Transformer(torch.nn.Module):
             torch.nn.init.ones_(module.weight)
 
     def forward(self, token_sequence, targets: Optional[torch.Tensor] = None):
-
         logger.debug(f"Transformer : Token sequence size {token_sequence.size()} \t " +
                      f"Targets size {targets.size() if targets is not None else None}")
 
@@ -204,7 +204,6 @@ class Transformer(torch.nn.Module):
             do_sample: bool = False, top_k: Optional[int] = None
     ) -> torch.Tensor:
         self.eval()
-
         for _ in range(max_new_tokens):
             token_sequence_sliced = token_sequence if token_sequence.size(1) <= self.config.context_length \
                 else token_sequence[:, -self.config.context_length:]
@@ -270,50 +269,44 @@ class Trainer:
         self.batch_start_time = 0.0
         self.batch_time = 0.0
 
-    def configure_optimizers(self, train_config):
-        """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
-        """
-
-        # separate out all parameters to those that will and won't experience regularizing weight decay
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, )
+    def configure_optimizers(self, trainer_config: TrainerConfig) -> None:
+        decay = set()  # Parameters which will have decay
+        no_decay = set()  # Parameters which will not have decay
+        whitelist_weight_modules = (torch.nn.Linear,)
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-        for mn, m in self.model.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-                # random note: because named_modules and named_parameters are recursive
-                # we will see the same tensors p many many times. but doing it this way
-                # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias'):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
 
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.model.named_parameters()}
+        for module_name, module in self.model.named_modules():
+            for param_name, param in module.named_parameters():
+                full_param_name = f"{module_name}.{param_name}" if module_name else param_name
+
+                if param_name.endswith("bias") or \
+                        (param_name.endswith("weight") and isinstance(module, blacklist_weight_modules)):
+                    no_decay.add(full_param_name)
+
+                if param_name.endswith("weight") and isinstance(module, whitelist_weight_modules):
+                    decay.add(full_param_name)
+
+        # Validate parameters split correctly between decay and no decay sets
+        param_dict = {param_name: param for param_name, param in self.model.named_parameters()}
         inter_params = decay & no_decay
         union_params = decay | no_decay
-        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params), )
 
-        # create the pytorch optimizer object
+        assert len(inter_params) == 0, f"Parameters {inter_params} found in both sets"
+        assert len(param_dict.keys() - union_params) == 0, \
+            f"Parameters {str(param_dict.keys() - union_params)} were not separated into decay/no_decay sets"
+
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+            {
+                "params": [param_dict[param_name] for param_name in sorted(list(decay))],
+                "weight_decay": trainer_config.weight_decay
+            },
+            {
+                "params": [param_dict[param_name] for param_name in sorted(list(no_decay))],
+                "weight_decay": 0.0
+            },
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
-        return optimizer
+
+        self.optimizer = torch.optim.AdamW(optim_groups, lr=trainer_config.learning_rate, betas=trainer_config.betas)
 
     def add_callback(self, event: str, callback):
         self.callbacks[event].append(callback)
@@ -326,10 +319,9 @@ class Trainer:
             callback(self)
 
     def run(self) -> torch.nn.Module:
-
         logger.debug("run : Training started")
 
-        self.optimizer = self.configure_optimizers(self.config)
+        self.configure_optimizers(self.config)
 
         logger.debug("run : Configured optimizer")
 
